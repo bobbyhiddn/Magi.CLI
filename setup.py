@@ -13,7 +13,8 @@ setup(
     install_requires=[
         'Click',
         'requests',
-        'setuptools'
+        'setuptools',
+        'svgwrite'
     ],
     entry_points={
         'console_scripts': [
