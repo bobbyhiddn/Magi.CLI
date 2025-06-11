@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import click
+import os
 import sys
 import yaml
 import hashlib
@@ -8,6 +9,8 @@ import shutil
 import tempfile
 import subprocess
 import requests
+import glob
+import inspect
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -45,6 +48,59 @@ class SpellRecipe:
         # Add tome_dir attribute
         self.tome_dir = Path(SANCTUM_PATH) / '.tome'
         self.tome_dir.mkdir(parents=True, exist_ok=True)
+
+    def _get_spells_dir(self) -> str:
+        """Get the spells directory from the magi_cli package."""
+        try:
+            from magi_cli import spells
+            spells_dir = os.path.dirname(inspect.getfile(spells))
+            return spells_dir
+        except (ImportError, TypeError):
+            click.echo("Warning: Could not dynamically find magi_cli spells directory, falling back.", err=True)
+            # Fallback for when magi_cli is not installed in a standard way
+            for path in sys.path:
+                if 'site-packages' in path and 'magi_cli' in os.listdir(path):
+                    return os.path.join(path, 'magi_cli', 'spells')
+            return os.path.join(os.getcwd(), 'spells')
+
+    def _is_integrated_spell(self, script_path: Path) -> bool:
+        """Check if the script imports from magi_cli."""
+        try:
+            with open(script_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            return 'from magi_cli' in content
+        except Exception:
+            return False
+
+    def install_integrated_spell(self, script_path: Path, spell_name: str) -> None:
+        """Install a spell directly into the magi_cli package, mimicking ponder."""
+        spells_dir = self._get_spells_dir()
+        target_path = Path(spells_dir) / f"{spell_name}.py"
+
+        shutil.copy2(script_path, target_path)
+        click.echo(f"Installed '{spell_name}' as an integrated spell at: {target_path}")
+
+        # Update the RECORD file for package integrity
+        site_packages = os.path.dirname(os.path.dirname(spells_dir))
+        dist_info_pattern = os.path.join(site_packages, "magi_cli_pypi-*.dist-info")
+        dist_info_dirs = glob.glob(dist_info_pattern)
+
+        if dist_info_dirs:
+            record_path = os.path.join(dist_info_dirs[0], "RECORD")
+            if os.path.exists(record_path):
+                try:
+                    with open(record_path, 'r+', encoding='utf-8') as f:
+                        records = f.readlines()
+                        # Use forward slashes for consistency in RECORD files
+                        relative_path = f"magi_cli/spells/{spell_name}.py".replace('\\', '/')
+                        if not any(relative_path in record.replace('\\', '/') for record in records):
+                            f.seek(0, os.SEEK_END) # Go to the end of the file
+                            f.write(f"{relative_path},,\n")
+                            click.echo(f"Updated RECORD file for '{spell_name}'.")
+                except Exception as e:
+                    click.echo(f"Warning: Failed to update RECORD file: {e}", err=True)
+        else:
+            click.echo("Warning: Could not find .dist-info to update RECORD file.", err=True)
 
     def _generate_metadata(self, description: str, entry_point: str, shell_type: str = "python") -> dict:
         """Generate standard metadata for the spell."""
@@ -336,8 +392,14 @@ class SpellRecipe:
         
         return bundle_path
 
-    def create_script_spell(self, script_path: Path, description: str) -> Path:
+    def create_script_spell(self, script_path: Path, description: str) -> Optional[Path]:
         """Create a spell from a Python or Shell script."""
+        # Check for integrated spells that depend on magi_cli
+        if self._is_integrated_spell(script_path):
+            click.echo(f"Detected integrated spell. Installing '{self.spell_name}' directly into magi_cli...")
+            self.install_integrated_spell(script_path, self.spell_name)
+            return None # Return None as no bundle is created
+
         # Determine shell type
         shell_type = "python" if script_path.suffix == '.py' else "bash"
         
@@ -474,11 +536,14 @@ def spellcraft(args, verbose):
 
             recipe = SpellRecipe(spell_name, "script")
             bundle_path = recipe.create_script_spell(input_path, description)
+            if bundle_path:
+                click.echo(get_success_message(f"Spell crafted successfully: {bundle_path}"))
 
-        elif input_path.is_dir() and input_path.name.endswith('.spell'):
-            spell_name = spell_name or input_path.stem
+        elif Path(args[0]).is_dir():  # Bundled spell
+            source_dir = Path(args[0]).resolve()
+            spell_name = spell_name or source_dir.stem
             # For bundled spells, try to get description from spell.yaml first
-            yaml_path = input_path / 'spell' / 'spell.yaml'
+            yaml_path = source_dir / 'spell' / 'spell.yaml'
             if yaml_path.exists():
                 try:
                     with open(yaml_path) as f:
@@ -491,7 +556,8 @@ def spellcraft(args, verbose):
                 description = click.prompt("Enter spell description")
 
             recipe = SpellRecipe(spell_name, "bundled")
-            bundle_path = recipe.create_bundled_spell(input_path, description)
+            bundle_path = recipe.create_bundled_spell(source_dir, description)
+            click.echo(get_success_message(f"Spell crafted successfully: {bundle_path}"))
         else:
             raise click.UsageError(
                 "Invalid input. Must be:\n"
@@ -500,8 +566,6 @@ def spellcraft(args, verbose):
                 "- A .py or .sh script file\n"
                 "- A .spell directory for bundled spells"
             )
-
-        click.echo(get_success_message(f"Spell crafted successfully: {bundle_path}"))
 
     except Exception as e:
         click.echo(f"Error crafting spell: {str(e)}", err=True)
